@@ -1,12 +1,13 @@
 import os 
 import sys
 from datetime import datetime, timezone
+import logging
 
 import pandas as pd
 import requests
 from dotenv import load_dotenv
 from google.cloud import bigquery
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+from tenacity import before_sleep_log, retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 
 from config import (
@@ -26,6 +27,8 @@ API_KEY = os.environ["YOUTUBE_API_KEY"]
 TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
 RATE_LIMIT_REASONS = {"rateLimitExceeded", "userRateLimitExceeded"}
 
+logger = logging.getLogger(__name__)
+
 def error_reason(error):
     try:
         return error.response.json()["error"]["errors"][0]["reason"]
@@ -44,7 +47,7 @@ def is_transient(error):
         stop = stop_after_attempt(5),
         wait = wait_exponential(multiplier=1, max=30),
         retry = retry_if_exception(is_transient),
-        before_sleep=lambda state: print(f"Retry {state.attempt_number} after: {state.outcome.exception()}"),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise = True,
 )
 def get_json(endpoint, params):
@@ -161,22 +164,30 @@ def main():
         video_ids = get_video_ids(uploads)
         rows = [to_video_row(video) | metadata for video in get_videos(video_ids)]
         video_rows += rows
-        print(f"{title}: {len(video_ids)} ids, {len(rows)} videos")
+
+        missing = set(video_ids) - {row["video_id"] for row in rows}
+        if missing:
+            logger.warning("%s: %d videos not returned (private or deleted): %s", title, len(missing), sorted(missing))
+        logger.info("%s: %d ids, %d videos", title, len(video_ids), len(rows))
 
     client = bigquery.Client(project=os.environ["BQ_PROJECT"])
-    print(f"channel_snapshots: sent {len(channel_rows)}, loaded {load_rows(client, CHANNEL_TABLE, channel_rows)}")
-    print(f"video_snapshots: sent {len(video_rows)}, loaded {load_rows(client, VIDEO_TABLE, video_rows)}")
+    for table_name, rows in [(CHANNEL_TABLE, channel_rows), (VIDEO_TABLE, video_rows)]:
+        loaded = load_rows(client, table_name, rows)
+        if loaded != len(rows):
+            raise RuntimeError(f"{table_name}: sent {len(rows)} rows but BigQuery loaded {loaded}")
+        logger.info("%s: loaded %d rows", table_name, loaded)
 
 if __name__=="__main__":
+   logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
    try:
        main()
    except requests.HTTPError as error:
        reason = error_reason(error)
        if reason == "quotaExceeded":
-           print("Daily quota exhausted.")
+           logger.error("Quota exhausted.")
        else:
-           print(f"API error {error.response.status_code}: {reason}")
+           logger.error("API error %s: %s", error.response.status_code, reason)
        sys.exit(1)
    except requests.RequestException as error:
-        print(f"Network error after retries: {error}")
+        logger.error("Network error after retries: %s", error)
         sys.exit(1)
