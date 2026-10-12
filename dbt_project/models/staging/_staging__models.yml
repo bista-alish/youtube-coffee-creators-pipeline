@@ -1,0 +1,36 @@
+version: 2
+
+models:
+  - name: stg_youtube__video_snapshots
+    description: "Typed video stats, one row per video per snapshot day (latest run that day wins)."
+    columns:
+      - name: video_id
+        data_tests: [not_null]
+      - name: snapshot_date
+        data_tests: [not_null]
+      - name: duration_secs
+        description: "Parsed from ISO 8601. 0 for upcoming premieres and live streams."
+      - name: like_count
+        description: "NULL when the creator hides likes."
+      - name: comment_count
+        description: "NULL when comments are disabled."
+
+  - name: stg_youtube__channel_snapshots
+    description: "Typed channel stats, one row per channel per snapshot day."
+    columns:
+      - name: channel_id
+        data_tests: [not_null]
+      - name: subscriber_count
+        description: "Rounded to 3 significant figures by YouTube. Not suitable for daily deltas."
+
+  - name: stg_youtube__videos
+    description: "Latest known state of each video. Videos deleted later keep their last-known stats."
+    columns:
+      - name: video_id
+        data_tests: [unique, not_null]
+
+  - name: stg_youtube__channels
+    description: "Latest known state of each channel."
+    columns:
+      - name: channel_id
+        data_tests: [unique, not_null]

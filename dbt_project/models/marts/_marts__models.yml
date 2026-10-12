@@ -1,0 +1,34 @@
+version: 2
+
+models:
+  - name: fct_video_performance
+    description: "One row per video (latest state). Excludes live streams and upcoming premieres."
+    columns:
+      - name: video_id
+        data_tests: [unique, not_null]
+      - name: channel_title
+        description: "From the latest channel snapshot. NULL here means the join missed."
+        data_tests: [not_null]
+      - name: length_band
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['0-3 min', '3-10 min', '10-20 min', '20-40 min', '40+ min']
+      - name: is_short_estimate
+        description: "Estimate: duration of 180 seconds or less. The API has no Shorts flag."
+      - name: engagement_rate
+        description: "(likes + comments) / views. NULL when either count is hidden."
+      - name: publish_hour_utc
+        description: "UTC. The creators publish from different time zones."
+      - name: views_per_day_since_publish
+        description: "Age-normalized views. Compare within similar age ranges, as older videos accrue views more slowly."
+
+  - name: fct_video_growth
+    description: "One row per video per snapshot day, with views gained since the previous snapshot."
+    columns:
+      - name: video_id
+        data_tests: [not_null]
+      - name: snapshot_date
+        data_tests: [not_null]
+      - name: views_gained
+        description: "NULL on a video's first snapshot."

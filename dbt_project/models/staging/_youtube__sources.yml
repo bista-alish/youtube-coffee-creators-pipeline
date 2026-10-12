@@ -1,0 +1,17 @@
+version: 2
+
+sources:
+  - name: youtube
+    description: "Raw snapshots loaded by extract/main.py. Append-only, all source fields as STRING."
+    database: coffee-creators-analytics
+    schema: raw_youtube
+    config:
+      loaded_at_field: _extracted_at
+      freshness:
+        warn_after: {count: 26, period: hour}
+        error_after: {count: 50, period: hour}
+    tables:
+      - name: channel_snapshots
+        description: "One row per channel per extractor run."
+      - name: video_snapshots
+        description: "One row per video per extractor run."
