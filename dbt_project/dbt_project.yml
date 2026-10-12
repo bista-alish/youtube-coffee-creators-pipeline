@@ -1,0 +1,16 @@
+name: youtube_pipeline
+version: "1.0.0"
+profile: youtube_pipeline
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+
+models:
+  youtube_pipeline:
+    staging:
+      +materialized: view
+      +schema: staging
+    marts:
+      +materialized: table
+      +schema: marts
