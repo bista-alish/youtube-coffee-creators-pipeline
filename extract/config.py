@@ -10,3 +10,7 @@ CHANNEL_IDS = [
 
 PAGE_SIZE = 50
 MAX_VIDEOS_PER_CHANNEL = 1000
+
+BQ_DATASET = "raw_youtube"
+CHANNEL_TABLE = "channel_snapshots"
+VIDEO_TABLE = "video_snapshots"

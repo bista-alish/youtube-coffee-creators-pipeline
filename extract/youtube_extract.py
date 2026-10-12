@@ -1,25 +1,66 @@
 import os 
+import sys
 
 import requests
 from dotenv import load_dotenv
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+from datetime import datetime, timezone
+import pandas as pd
+from google.cloud import bigquery
 
-from config import BASE_URL, CHANNEL_IDS, REQUEST_TIMEOUT_SECS, PAGE_SIZE, MAX_VIDEOS_PER_CHANNEL
+
+from config import (
+    BASE_URL, 
+    CHANNEL_IDS, 
+    REQUEST_TIMEOUT_SECS, 
+    PAGE_SIZE, 
+    MAX_VIDEOS_PER_CHANNEL
+)
 
 load_dotenv()
 API_KEY = os.environ["YOUTUBE_API_KEY"]
 
-def get_channels(channel_ids):
+TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
+RATE_LIMIT_REASONS = {"rateLimitExceeded", "userRateLimitExceeded"}
+
+def error_reason(error):
+    try:
+        return error.response.json()["error"]["errors"][0]["reason"]
+    except (ValueError, KeyError, IndexError):
+        return "unknown"
+
+def is_transient(error):
+    if isinstance(error, (requests.ConnectionError, requests.Timeout)):
+        return True
+    if isinstance(error, requests.HTTPError):
+        status = error.response.status_code
+        return status in TRANSIENT_STATUSES or error_reason(error) in RATE_LIMIT_REASONS
+    return False
+
+@retry(
+        stop = stop_after_attempt(5),
+        wait = wait_exponential(multiplier=1, max=30),
+        retry = retry_if_exception(is_transient),
+        before_sleep=lambda state: print(f"Retry {state.attempt_number} after: {state.outcome.exception()}"),
+        reraise = True,
+)
+def get_json(endpoint, params):
     response = requests.get(
-        f"{BASE_URL}/channels",
-        params = {
-            "part": "snippet,statistics,contentDetails",
-            "id": ",".join(channel_ids),
-        },
+        f"{BASE_URL}/{endpoint}",
+        params=params,
         headers={"X-Goog-Api-Key": API_KEY},
         timeout=REQUEST_TIMEOUT_SECS,
     )
     response.raise_for_status()
-    channels = response.json().get("items", [])
+    return response.json()
+
+
+def get_channels(channel_ids):
+    data = get_json("channels", {
+        "part": "snippet,statistics,contentDetails",
+        "id": ",".join(channel_ids),
+    })
+    channels = data.get("items", [])
 
     missing = set(channel_ids) - {channel["id"] for channel in channels}
     if missing:
@@ -32,19 +73,12 @@ def get_video_ids(uploads_playlist_id):
     page_token = None
 
     while True:
-        response = requests.get(
-            f"{BASE_URL}/playlistItems",
-            params={
-                "part":"contentDetails",
-                "playlistId": uploads_playlist_id,
-                "maxResults": PAGE_SIZE,
-                "pageToken": page_token,
-            },
-            headers={"X-Goog-Api-Key": API_KEY},
-            timeout=REQUEST_TIMEOUT_SECS,
-        )
-        response.raise_for_status()
-        data = response.json()
+        data = get_json("playlistItems", {
+            "part":"contentDetails",
+            "playlistId": uploads_playlist_id,
+            "maxResults": PAGE_SIZE,
+            "pageToken": page_token,
+        })
 
         video_ids += [item["contentDetails"]["videoId"] for item in data.get("items", [])]
         
@@ -54,12 +88,60 @@ def get_video_ids(uploads_playlist_id):
 
     return video_ids[:MAX_VIDEOS_PER_CHANNEL]
 
+def get_videos(video_ids):
+    videos = []
+    for start in range(0, len(video_ids), PAGE_SIZE):
+        batch = video_ids[start:start + PAGE_SIZE]
+        data = get_json("videos", {
+                "part": "snippet,statistics,contentDetails",
+                "id": ",".join(batch),  
+        })
 
+        videos += data.get("items", [])
+    return videos
 
-if __name__=="__main__":
+def to_video_row(video):
+    snippet = video["snippet"]
+    stats = video["statistics"]
+    return{
+        "video_id": video["id"],
+        "channel_id": snippet["channelId"],
+        "title": snippet["title"],
+        "published_at": snippet["publishedAt"],
+        "duration": video["contentDetails"]["duration"],
+        "view_count": stats.get("viewCount"),
+        "like_count": stats.get("likeCount"),
+        "comment_count": stats.get("commentCount"),
+        "live_broadcast_content": snippet["liveBroadcastContent"],
+    }
+
+def main():
+    all_rows = []
     for channel in get_channels(CHANNEL_IDS):
         title = channel["snippet"]["title"]
         uploads = channel["contentDetails"]["relatedPlaylists"]["uploads"]
-        video_count = channel["statistics"]["videoCount"]
         video_ids = get_video_ids(uploads)
-        print(f"{title}: {len(video_ids)} IDs fetched, videoCount says {video_count}")
+        rows = [to_video_row(video) for video in get_videos(video_ids)]
+        all_rows += rows
+    
+        hidden_likes = sum(1 for row in rows if row["like_count"] is None)
+        no_comments = sum(1 for row in rows if row["comment_count"] is None)
+        print(f"{title}: {len(video_ids)} ids, {len(rows)} videos, "
+              f"{hidden_likes} hidden likes, {no_comments} without comment count")
+    
+        print(rows[0])
+        print(f"Total: {len(all_rows)} rows")
+
+if __name__=="__main__":
+   try:
+       main()
+   except requests.HTTPError as error:
+       reason = error_reason(error)
+       if reason == "quotaExceeded":
+           print("Daily quota exhausted.")
+       else:
+           print(f"API error {error.response.status_code}: {reason}")
+       sys.exit(1)
+   except requests.RequestException as error:
+        print(f"Network error after retries: {error}")
+        sys.exit(1)
