@@ -1,12 +1,12 @@
 import os 
 import sys
+from datetime import datetime, timezone
 
+import pandas as pd
 import requests
 from dotenv import load_dotenv
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
-from datetime import datetime, timezone
-import pandas as pd
 from google.cloud import bigquery
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 
 from config import (
@@ -14,7 +14,10 @@ from config import (
     CHANNEL_IDS, 
     REQUEST_TIMEOUT_SECS, 
     PAGE_SIZE, 
-    MAX_VIDEOS_PER_CHANNEL
+    MAX_VIDEOS_PER_CHANNEL,
+    BQ_DATASET,
+    CHANNEL_TABLE,
+    VIDEO_TABLE,
 )
 
 load_dotenv()
@@ -115,22 +118,54 @@ def to_video_row(video):
         "live_broadcast_content": snippet["liveBroadcastContent"],
     }
 
+def to_channel_row(channel):
+    stats = channel["statistics"]
+    return {
+        "channel_id": channel["id"],
+        "title": channel["snippet"]["title"],
+        "subscriber_count":stats.get("subscriberCount"),
+        "video_count": stats.get("videoCount"),
+        "view_count": stats.get("viewCount"),
+    }
+
+def load_rows(client, table_name, rows):
+    df = pd.DataFrame(rows)
+    schema = [
+        bigquery.SchemaField(column, "TIMESTAMP" if column == "_extracted_at" else "STRING")
+        for column in df.columns
+    ]
+    job_config = bigquery.LoadJobConfig(
+        schema = schema,
+        write_disposition = "WRITE_APPEND",
+        clustering_fields = ["channel_id"],
+    )
+    table_id = f"{os.environ['BQ_PROJECT']}.{BQ_DATASET}.{table_name}"
+    job = client.load_table_from_dataframe(df, table_id, job_config=job_config)
+    job.result()
+    return job.output_rows
+
 def main():
-    all_rows = []
-    for channel in get_channels(CHANNEL_IDS):
+    extracted_at = datetime.now(timezone.utc)
+    metadata = {
+        "_extracted_at": extracted_at,
+        "_snapshot_id": extracted_at.strftime("%Y%m%dT%H%M%SZ"),
+    }
+
+    channels = get_channels(CHANNEL_IDS)
+    channel_rows = [to_channel_row(channel) | metadata for channel in channels]
+
+    video_rows = []
+    for channel in channels:
         title = channel["snippet"]["title"]
         uploads = channel["contentDetails"]["relatedPlaylists"]["uploads"]
         video_ids = get_video_ids(uploads)
-        rows = [to_video_row(video) for video in get_videos(video_ids)]
-        all_rows += rows
-    
-        hidden_likes = sum(1 for row in rows if row["like_count"] is None)
-        no_comments = sum(1 for row in rows if row["comment_count"] is None)
-        print(f"{title}: {len(video_ids)} ids, {len(rows)} videos, "
-              f"{hidden_likes} hidden likes, {no_comments} without comment count")
-    
-        print(rows[0])
-        print(f"Total: {len(all_rows)} rows")
+        rows = [to_video_row(video) | metadata for video in get_videos(video_ids)]
+        video_rows += rows
+        print(f"{title}: {len(video_ids)} ids, {len(rows)} videos")
+
+    client = bigquery.Client(project=os.environ["BQ_PROJECT"])
+    print(f"channel_snapshots: sent {len(channel_rows)}, loaded {load_rows(client, CHANNEL_TABLE, channel_rows)}")
+    print(f"video_snapshots: sent {len(video_rows)}, loaded {load_rows(client, VIDEO_TABLE, video_rows)}")
 
 if __name__=="__main__":
    try:
